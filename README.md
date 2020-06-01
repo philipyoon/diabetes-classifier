@@ -1,2 +1,2 @@
-# diabetes_classification
-testing different classification models to predict diabetes diagnosis
+# Diabetes Forecasting
+Testing different classification models to predict diabetes diagnosis.
