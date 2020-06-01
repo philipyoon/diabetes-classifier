@@ -1,0 +1,475 @@
+---
+title: "Forecasting Diabetes Diagnosis"
+author: "Amelia de Leon, Philip Yoon"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: 
+  pdf_document:
+    fig_caption: TRUE
+---
+
+```{r setup, include=FALSE}
+# Sets global settings for all r chunks
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='Figs/',
+                      echo=FALSE, warning=FALSE, message=FALSE)
+
+options(digits = 4)  # limit number of significant digits to 4
+```
+
+```{r, include=FALSE}
+library(tidyverse) 
+library(class)  
+library(psych)
+library(gridExtra)
+
+# for logistic regression
+library(ROCR)
+
+#for lasso
+library(glmnet)
+
+# for svm
+library(e1071)
+```
+
+## Research Question:
+Based on certain diagnostic measurements like BMI, blood pressure, and glucose levels, would one be able to predict whether an individual has diabetes or not? Being able to identify and predict this disease would be the first step towards stopping its progression and recommending preventative measures for those of highest risk.
+
+In this project, we hope to compare and contrast different models to obtain a classifier that best detects the presence of diabetes based on measurable physiological traits.
+
+```{r, include=FALSE}
+# read in dataset
+data = read_csv("diabetes.csv")
+```
+
+## Data:
+
+We are using data based on individuals of Pima Indian heritage. The dataset consists of 9 variables, of which 8 are numerical and medical predictor variables and 1 is the response variable ‘Outcome’. Each observation represents a female at least 21 years old.
+
+Variables:
+- Pregnancies: number of times pregnant
+- BMI: body mass index (weight in kg/(height in m)^2)
+- Glucose: plasma glucose concentration
+- BloodPressure: diastolic blood pressure (mm Hg)
+- SkinThickness: Triceps skin fold thickness (mm)
+- Insulin: 2 hour serum insulin (mm U/ml)
+- DiabetesPedigreeFunction: function which scores likelihood of diabetes based on family history
+- Age: age (in years) all patients are female of at least age 21
+- Outcome: 1 if diabetes diagnosis, 0 otherwise
+
+The dataset is originally from the National Institute of Diabetes and Digestive and Kidney Diseases. 
+
+```{r}
+# data dimensions
+# dim(data)
+
+# data summary
+summary(data)
+```
+
+We can view how many 0's occur in each column.
+
+```{r}
+# count 0 values per column
+colSums((data == 0))
+```
+
+For Glucose, BloodPressure, SkinThickness, Insulin, and BMI, 0's are equivalent to missing values because measurements of 0 are impossible.
+
+In the case of Insulin and SkinThickness, since such a large percent of the observations are missing (50% and 30% respectively), attempted imputation would surely be inaccurate. For this reason, despite them being potentially-impactful variables, we will remove them.
+
+For the case of Glucose, BloodPressure, and BMI, the missing values take on a very small percent of total observations. We will remove those observations entirely since it only decreases the size of our dataset by 5% with a minimal loss of statistical power. 
+
+Thus the final variables we will use in our models will be
+```{r}
+# remove the two columns with many 0s and filter for non 0s in the others
+data = data %>% select(-c(SkinThickness, Insulin)) %>% filter(Glucose != 0 & BMI != 0 & BloodPressure != 0)
+
+# list of remaning columns
+colnames(data)
+```
+
+```{r}
+# set seed for random split
+set.seed(1)
+
+# split the data 70/30 into training and testing sets
+train = sample(1:nrow(data), nrow(data)*0.7)
+data.train = data[train,]
+data.test = data[-train,]
+
+# break the training and testing sets into outcome and predictors
+ytrain = data.train$Outcome
+xtrain = data.train %>% select(-Outcome)
+
+ytest = data.test$Outcome
+xtest = data.test %>% select(-Outcome)
+train
+```
+
+## Exploratory Graphics
+
+```{r}
+#Histograms for all the predictors
+p1= ggplot(data = data, aes(x= Pregnancies))+
+  geom_histogram(bins = 17)
+
+p2= ggplot(data = data, aes(x= Glucose))+
+  geom_histogram(bins = 20)
+
+p3= ggplot(data = data, aes(x= BloodPressure))+
+  geom_histogram(bins = 15)
+
+p6 = ggplot(data = data, aes(x= BMI))+
+  geom_histogram(bins = 15)
+
+p7= ggplot(data = data, aes(x= Age))+
+  geom_histogram(bins = 30)
+
+p8 = ggplot(data = data, aes(x= DiabetesPedigreeFunction))+
+  geom_histogram(bins = 15)
+
+grid.arrange(p1,p2,p3,p6,p7,p8, ncol = 2)
+```
+Viewing histograms for each predictor, we can see Pregnancies, Age, and DiabetesPedigreeFunction are all heavily skewed right while Glucose, Blood Pressure, and BMI all are fairly normally distributed.
+
+For all the predictors there are outliers which we will have to consider when fitting models.
+
+Now we will use scatterplots to show the bivariate relationships as well as the correlation coefficients between the predictors, which can indicate possible linear relationships.
+
+```{r, fig.cap='Bivariate Scatterplots'}
+pairs.panels(data, 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,
+             # show density plots
+             alpha = 0.1, 
+             col = "pink"
+                      )
+```
+There are not many obvious patterns between the predictors with most of them looking randomly distributed. We prefer prefer minimal correlation between predictors because otherwise we are getting redundant information from including both variables.
+
+Pregnancies and Age are the most heavily correlated. This makes sense from a logical perspective. The number of pregnancies is cummulative so is follows that it would increase with age.
+
+Blood Pressure and Age are the next highest correlated predictors. It is well known that age and blood pressure have a positive linear relationship.
+
+Holding all other variables constant, Glucose by far has the largest correlation to Outcome.
+
+Because the degree of bivariate relationships between the predictors is relatively low (below 0.8) it should not impact the results of a typical regression immensely; however, it does slightly undermine the independent variable assumption of the predictors. We should also keep in mind it does not address any non-linear relationships between the predictors.
+
+## KNN Model Fitting
+
+We will first attempt the K-nearest-neighbor model for this classification problem. Because it is non-parametric, no prior assumptions are made about the data making it an easy and general model to use. 
+
+However, some of the drawbacks include: 
+- exponential computation time for large datasets, since the cost of calculating the distance between points can lessen performance. 
+- difficulty with higher-dimensional data, since calculating distance in higher-dimensional space becomes more difficult
+- sensitivity to noise because the KNN model is highly reliant on the quality of the training dataset
+
+```{r}
+# center and scale predictors
+xtrain_scaled = scale(xtrain, center = TRUE, scale = TRUE)
+meanvec = attr(xtrain_scaled,'scaled:center')
+sdvec = attr(xtrain_scaled,'scaled:scale')
+xtest_scaled = scale(xtest, center = meanvec, scale = sdvec)
+```
+
+```{r}
+# err_vec will be a vector to save validation errors
+err_vec = NULL
+kVals = 1:100
+
+# set seed for reproducability
+set.seed(1)
+
+# loop through all k values, using LOOCV to find validation errors
+for (i in kVals){ 
+  pred.Yval = knn.cv(train=xtrain_scaled, cl=ytrain, k=i)
+  err_vec = c(err_vec, mean(pred.Yval!=ytrain)) 
+}
+
+# best k found that minimizes training error
+bestK = max(kVals[err_vec == min(err_vec)])
+```
+
+Because KNN is a distance based algorithm, we center and scale the predictors first so distances can be calculated on the same scale.
+
+```{r}
+# set seed for reproducibility
+set.seed(1)
+
+# fit knn model using bestK
+pred.ytrain = knn(train=xtrain_scaled, test=xtrain_scaled, cl=ytrain, k=bestK)
+
+# calculate confusion matrix
+conf.train = table(predicted=pred.ytrain, observed=ytrain)
+conf.train
+
+# accuracy and error of train set
+train_acc = sum(diag(conf.train)/sum(conf.train))
+train_err = 1-sum(diag(conf.train)/sum(conf.train))
+train_err
+```
+
+After using Leave-One-Out-Cross-Validation(LOOCV) to find the number of neighbors to consider that minimizes training error, we find k=`r bestK` with a training error of `r train_err`%. 
+
+```{r}
+# fit knn model using bestK
+pred.ytest = knn(train=xtrain_scaled, test=xtest_scaled, cl=ytrain, k=bestK)
+
+# calculate confusion matrix
+conf.test = table(predicted=pred.ytest, observed=ytest)
+conf.test
+
+# accuracy and error of test set
+test_acc = sum(diag(conf.test)/sum(conf.test))
+test_err = 1 - sum(diag(conf.test)/sum(conf.test))
+test_err
+```
+
+Applying the same model to the test set we find using LOOCV K-Nearest-Neighbors produces a model with a test error of `r test_err`%.
+
+## Logisic Regression Model Fitting
+
+We will now try a logistic regression model to see if we can improve upon kNN's testing error. Logistic regression is another generalized linear model that regresses for the probability of a categorical outcome using maximum likelihood to estimate coefficient and a logarithmic loss function to calculate the cost for misclassifying. 
+
+Compared to k-Nearest-Neighbors, logistic regression is a parametric method with a few assumptions. The most relevant include independence of observations and little to no multicollinearity. We remember from the Bivariate Scatterplots that there was a decent correlation between Age and Pregnancy which may negatively affect the logistic regression fit.
+
+```{r}
+# fit logistic regression model by specifying family=binomial
+glm.fit = glm(Outcome~., data=data.train, family=binomial)
+
+summary(glm.fit)
+```
+Fitting the model we can see every predictor except BloodPressure is statistically significant at level 0.05. The predictor Pregnancies has a coefficient of `r glm.fit$coefficients[2]` which means every additional pregnancy increases the log odds of receiving a diabetes diagnosis by that amount.
+
+Before we can use the model for predictions, we want to find the ideal probability threshold cutoff that minimizes the false positive and false negative rates when converting probabilities to factors 0 or 1. 
+
+```{r, fig.cap="Effect of Probability Threshold on Error Rates"}
+# use the model to find the predicted probablities of the training data
+prob.training = round(predict(glm.fit, type="response"), digits = 2)
+
+# use prediction() and performance() from ROCR package to obtain false posiive rate and false negative rate
+pred = prediction(predictions = prob.training, labels = ytrain)
+fpr = performance(pred, "fpr")@y.values[[1]]
+cutoff = performance(pred, "fpr")@x.values[[1]]
+
+fnr =  performance(pred,"fnr")@y.values[[1]]
+
+# plot the two on the same graph so can see the point where both are minimized. 
+matplot(cutoff, cbind(fpr,fnr), type="l",lwd=2, xlab="Threshold",ylab="Error Rate")
+legend(0.3, 1, legend=c("False Positive Rate","False Negative Rate"),
+col=c(1,2), lty=c(1,2))
+```
+
+```{r}
+#combine the false positives, false negatives and cutoffs into one data frame
+rate = as.data.frame(cbind(Cutoff=cutoff, FPR=fpr, FNR=fnr))
+
+#looking for the distances from 0 of each pair of false positive and false negative rates
+rate$distance = sqrt((rate[,2])^2+(rate[,3])^2)
+
+#take the index that produced the smallest value
+index = which.min(rate$distance)
+
+#take the cutoff value at that index since it produced the pair of false positive and false negative rates that was the smallest overall
+threshold =  rate$Cutoff[index]
+```
+
+We see from the above figure a threshhold of `r threshold` that minimizes both False Positive Rates and False Negative Rates.
+
+```{r}
+# use the predict function to find the probability predictions from the model
+prob.testing = round(predict(glm.fit, data.test, type = "response"), digits = 2)
+
+# turn the probablilities into classification with ifelse, if greater or equal to the threashold value then a 1, otherwise a 0
+# take these classification values as the yhats
+yhat = ifelse(prob.testing >= threshold, 1, 0)
+
+# construct confusion matrix
+confusion_matrix = table(obs= ytest, pred = yhat)
+confusion_matrix
+
+# calculate test error
+test_err = 1-sum(diag(confusion_matrix))/sum(confusion_matrix)
+test_acc = 1-test_err
+test_err
+```
+
+Using this value to fit the logistic regression model, the fit produces a test error of `r test_err`%.
+
+## Regularized Lasso
+From Logistic Regression we move on to fitting and testing a Lasso Regression Model. Since the logistic regression model pointed to the possibility of not all of the predictor variables being highly significant, we can try a Lasso model which sets certain coefficients to zero, resulting in a simpler model.
+
+```{r}
+#prepare the data as a matrix that can be used
+x= model.matrix(Outcome ~., data)[,-1]
+```
+
+We use cross validation to find the best value for the penalty term $\lambda$. The plot below shows the misclassification rate with various values of $\lambda$  
+
+```{r, fig.cap="Effect of Lambda for Lasso"}
+#set up the cross validation with the training part of the data
+cvfitL <- cv.glmnet(x[train,], ytrain, family = "binomial", type.measure = "class",gamma=1,alpha=1)
+
+#plot the results from the cross validation
+plot(cvfitL)
+```
+
+```{r}
+#take the best value of lam
+bestlambda <- cvfitL$lambda.min
+```
+
+We see that the best value of lambda is `r bestlambda`.
+
+
+```{r}
+#View the coefficents that were fitted
+coef(cvfitL,s=bestlambda)
+```
+
+The BloodPressure coefficent has been sent to zero and so only five of the original predictors are being used in this model. 
+
+Now to see how it preforms on the test set
+```{r}
+y = data$Outcome
+#fit values based on model
+yhatL = as.factor(predict(cvfitL,x[-train,],s=bestlambda,type="class"))
+
+#construct confusion matrix for test set
+confusion_matrix = table(y[-train],yhatL)
+
+confusion_matrix
+#calculate test accuracy and error from confusion matrix
+test_err = 1-sum(diag(confusion_matrix))/sum(confusion_matrix)
+test_acc = 1-test_err
+test_err
+```
+
+We see the lasso model produces an test error of `r test_err`%.
+
+## Ridge Regression
+
+Since the Lasso Model was not an improvement on the Logistic Regression or knn model, we now try a Ridge model. It is very similar in set up to the Lasso but because of the way penalty is calculated; however, none of the coeffiecients will be zero and all of the predictors will remain in the model. 
+
+```{r, fig.cap="Effect of Lambda for Ridge"}
+#set up the cross validation with the training part of the data, alpha now equal 0 instead of 1
+cvfitR <- cv.glmnet(x[train,], ytrain, family = "binomial", type.measure = "class",gamma=1,alpha=0)
+
+#plot the results from the cross validation
+plot(cvfitL)
+```
+
+```{r}
+#take the best value of lam
+bestlambda <- cvfitL$lambda.min
+```
+We see that the best $\lambda$ value for this model is `r bestlambda`.
+
+
+```{r}
+#View the coefficents that were fitted
+coef(cvfitL,s=bestlambda)
+```
+
+Since this is a Ridge model, while the BloodPressure coefficient is very small, it is not all the way at zero as it was in the Lasso model. 
+
+Now to see how it performs on the test set
+```{r}
+y = data$Outcome
+#fit values based on model
+yhatL <- as.factor(predict(cvfitR,x[-train,],s=bestlambda,type="class"))
+
+#construct confusion matrix for test set
+confusion_matrix <- table(y[-train],yhatL)
+
+confusion_matrix
+#calculate test accuracy and error from confusion matrix
+test_err = 1-sum(diag(confusion_matrix))/sum(confusion_matrix)
+test_acc = 1-test_err
+test_err
+```
+
+The Ridge model produced an test error of `r test_err`%, which is on par with logistic regression.
+
+## SVM
+
+General SVM models attempt to construct a hyperplane that best seperates data into our response categories. This specific implementation works for a non-linear decision boundaries by enlargening feature space using the kernels. Thus in the enlarged feature space the decision boundary is linear, but in the original feature space the decision boundary can be non-linear. 
+
+Because SVM only depend on support vectors, the observations closest to the decision boundary, it is a computationally efficient algorithm and is robust to handle the outliers in our dataset.
+
+The hyperparameters of SVM include an adjustable $C$, which controls how many observations violate the decision boundary, the choice of the kernel, like polynmial or radial which decides the shape the decision boundary will have,  and $\gamma$, which controls the influence of an observation in deciding the decision boundary. 
+
+First we'll try a linear kernel (aka Support Vector Classifier) to see if a linear decision boundary is sufficient.
+
+```{r}
+set.seed(1)
+
+# fit linear svm models
+# cross validation using tune() to find optimal cost parameter 
+tune.out = tune(svm, as.factor(Outcome)~., data=data.train, kernel='linear',
+ranges=list(cost=c(0.1,1,10,100,1000)))
+
+summary(tune.out$best.model)
+```
+
+For a linear kernel, the best cross-validation error rate on the training set is `r tune.out$best.performance`%.
+
+```{r}
+# use predict() to compare with test set
+ypred = predict(tune.out$best.model, data.test)
+
+confusion_matrix = table(pred=ypred, obs=ytest)
+confusion_matrix
+
+test_err = 1-sum(diag(confusion_matrix))/sum(confusion_matrix)
+test_err
+```
+Using this on the test set we find a error rate of `r test_err`%. 
+
+Now we will try SVM with a radial kernel in case the data is not linearly separable.
+
+```{r}
+set.seed(1)
+
+# fit svm using radial kernel
+# cross validation using tune() to find optimal cost parameter 
+tune.radial = tune(svm, as.factor(Outcome)~., data=data.train, kernel='radial', ranges=list(cost=c(0.1,1,10,100,1000),gamma=c(0.5,1,2,3,4)))
+
+summary(tune.radial$best.model)
+```
+
+```{r}
+confusion_matrix = table(obs=ytest, pred=predict(tune.radial$best.model, data.test))
+
+test_err = 1-sum(diag(confusion_matrix))/sum(confusion_matrix)
+test_err
+```
+
+The error rate of the radial kernel SVM is quite high at `r test_err` even after cross-validating for optimal parameters, so we can conclude the data is better separated by a linear decision boundary.
+
+
+## Appendix
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
+
+
+<!-- **error rate reference: -->
+<!-- knn: 0.1857708 -->
+<!-- logistic regression: 0.2844037 -->
+<!-- ridge: 0.2844037 -->
+<!-- lasso: 0.293578 -->
+<!-- svm using linear kernel: 0.2981651 -->
+<!-- svm using radial kernel: 0.3119266 -->
+
+<!-- **To do -->
+<!-- - add labels to each confusion matrix specifying whether its based on training or test set -->
+<!-- - add title scatterplot and histogram plots -->
+<!-- - add more explanation and equations (using latex) to each method -->
+<!-- - reorganize into Methods section and Model Building (methods will be where we explain the method and show equations/math, model building will be actually showing the results of the implementaiton like confusion matrix and test error rates) -->
+
+<!-- # **Things to consider for conclusion: -->
+<!-- # - For blood pressue, only diastolic(pressure in blood vessels when heart rests between beats) pressure is reported, not systolic(pressure in blood vessels when heart beats). We should address this as a source of inconsistency in the dataset.  -->
+<!-- # - Distributions of data between test and train sets may be different, which results in worse results. We should check this by checking histograms of variables from test and train data, but it's something we may not have to address. If this is an issue I'll research more about how to address this issue. -->
+
